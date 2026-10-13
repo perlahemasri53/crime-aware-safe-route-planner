@@ -51,7 +51,13 @@
                     body: JSON.stringify({ start, end, mode })
                 });
 
-                const data = await response.json();
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch {
+                    throw new Error(`Server returned an unexpected response (${response.status}). Please try again.`);
+                }
                 console.log("Backend response:", data);
                 if (!response.ok) {
                     throw new Error(data.error || `Route request failed (${response.status})`);
