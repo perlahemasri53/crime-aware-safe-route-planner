@@ -1,5 +1,5 @@
-"""SafeRoute backend: Google Routes API + incident scoring."""
-import csv, math, os
+"""SafeRoute backend: OpenStreetMap routing + incident scoring."""
+import csv, math, os, time
 from collections import defaultdict
 from datetime import date, timedelta
 
@@ -8,9 +8,13 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
 
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 POLICE_NUMBER = os.getenv("POLICE_NUMBER", "112")
-ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
+ROUTING_URLS = {
+    "DRIVE": "https://routing.openstreetmap.de/routed-car/route/v1/driving",
+    "WALK": "https://routing.openstreetmap.de/routed-foot/route/v1/driving",
+}
+SERVICE_HEADERS = {"User-Agent": "SafeRoute/1.0 (open source route planner)"}
 
 RADIUS_M = 150          # an incident counts if it is within this distance of the route
 MAX_AGE_DAYS = 365      # ignore older incidents
@@ -23,6 +27,8 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 # ---------------------------------------------------------------- incident data
 GRID = defaultdict(list)
 _loaded_mtime = None
+_geocode_cache = {}
+_last_geocode_at = 0.0
 
 
 def cell(lat, lng):
@@ -54,7 +60,7 @@ def load_incidents():
     # ---------------------------------------------------------------- geometry
 def haversine(lat1, lng1, lat2, lng2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
-    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2
+    a = math.sin((p2 - p1) / 2) * 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lng2 - lng1) / 2) * 2
     return 6371000 * 2 * math.asin(math.sqrt(a))
 
 
@@ -111,7 +117,7 @@ def risk(incs):
 
 
 def summarize(route):
-    """Turn one Google route into our JSON shape, scoring each step (road segment)."""
+    """Turn one OSRM route into our JSON shape, scoring each road segment."""
     seen, steps = {}, []
     for leg in route.get("legs", []):
         for st in leg.get("steps", []):
@@ -130,29 +136,82 @@ def summarize(route):
         "stats": count(seen.values()),
         "steps": steps,
     }
-# ---------------------------------------------------------------- Google Routes API
+# ---------------------------------------------------------------- OpenStreetMap geocoding and OSRM routing
 class RouteError(Exception):
     def __init__(self, msg, status=502):
         super().__init__(msg)
         self.status = status
 
 
+def geocode(address):
+    global _last_geocode_at
+    cache_key = address.casefold()
+    if cache_key in _geocode_cache:
+        return _geocode_cache[cache_key]
+
+    # Nominatim's public service allows at most one request per second.
+    wait = 1.1 - (time.monotonic() - _last_geocode_at)
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        response = requests.get(GEOCODE_URL, params={"q": address, "format": "jsonv2", "limit": 1},
+                                headers=SERVICE_HEADERS, timeout=(5, 15))
+    except requests.Timeout as exc:
+        raise RouteError("OpenStreetMap geocoding timed out; please try again", 504) from exc
+    except requests.RequestException as exc:
+        raise RouteError("Could not reach OpenStreetMap geocoding; please try again", 502) from exc
+    _last_geocode_at = time.monotonic()
+    if not response.ok:
+        raise RouteError(f"OpenStreetMap geocoding returned HTTP {response.status_code}")
+    results = response.json()
+    if not results:
+        raise RouteError(f"Could not find a location for: {address}", 404)
+    coords = (float(results[0]["lon"]), float(results[0]["lat"]))
+    _geocode_cache[cache_key] = coords
+    return coords
+
+
+def maneuver_instruction(maneuver, street):
+    kind = maneuver.get("type", "continue").replace("_", " ")
+    modifier = maneuver.get("modifier", "")
+    instruction = f"{kind.capitalize()} {modifier}".strip()
+    return f"{instruction} onto {street}" if street else instruction
+
+
 def fetch_routes(start, end, mode="DRIVE"):
-    if not API_KEY:
-        raise RouteError("GOOGLE_MAPS_API_KEY is not set", 500)
-    body = {"origin": {"address": start}, "destination": {"address": end},
-            "travelMode": mode, "computeAlternativeRoutes": True}
-    if mode == "DRIVE":
-        body["routingPreference"] = "TRAFFIC_AWARE"
-    headers = {
-        "X-Goog-Api-Key": API_KEY,
-        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,"
-                            "routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
-    }
-    r = requests.post(ROUTES_URL, json=body, headers=headers, timeout=15)
-    if not r.ok:
-        raise RouteError(f"Google Routes API error {r.status_code}: {r.text[:300]}")
-    return r.json().get("routes", [])
+    origin, destination = geocode(start), geocode(end)
+    coordinates = f"{origin[0]},{origin[1]};{destination[0]},{destination[1]}"
+    url = f"{ROUTING_URLS[mode]}/{coordinates}"
+    params = {"alternatives": "true", "steps": "true", "overview": "full", "geometries": "polyline"}
+    try:
+        response = requests.get(url, params=params, headers=SERVICE_HEADERS, timeout=(5, 20))
+    except requests.Timeout as exc:
+        raise RouteError("OpenStreetMap routing timed out; please try again", 504) from exc
+    except requests.RequestException as exc:
+        raise RouteError("Could not reach OpenStreetMap routing; please try again", 502) from exc
+    if not response.ok:
+        raise RouteError(f"OpenStreetMap routing returned HTTP {response.status_code}")
+    result = response.json()
+    if result.get("code") != "Ok":
+        raise RouteError(result.get("message") or "OpenStreetMap could not find a route", 404)
+
+    routes = []
+    for route in result.get("routes", []):
+        legs = []
+        for leg in route.get("legs", []):
+            steps = [{
+                "polyline": {"encodedPolyline": step["geometry"]},
+                "navigationInstruction": {"instructions": maneuver_instruction(
+                    step.get("maneuver", {}), step.get("name", ""))},
+            } for step in leg.get("steps", []) if step.get("geometry")]
+            legs.append({"steps": steps})
+        routes.append({
+            "duration": f"{route['duration']}s",
+            "distanceMeters": route.get("distance", 0),
+            "polyline": {"encodedPolyline": route["geometry"]},
+            "legs": legs,
+        })
+    return routes
 
 
 # ---------------------------------------------------------------- API
@@ -187,8 +246,11 @@ def get_routes():
 
 @app.get("/")
 def index():
+    root_index = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.isfile(root_index):
+        return send_from_directory(os.path.dirname(__file__), "index.html")
     return send_from_directory(app.static_folder, "index.html")
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
