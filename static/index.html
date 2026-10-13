@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SafeRoute</title>
+    <!-- Leaflet CSS + JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        input, select, button { margin: 5px; padding: 8px; }
+        #map { height: 400px; margin-top: 20px; }
+        button { cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>SafeRoute</h1>
+
+    <!-- Input fields -->
+    <input id="start" type="text" placeholder="Enter start location" value="Connaught Place, New Delhi">
+    <input id="end" type="text" placeholder="Enter end location" value="India Gate, New Delhi">
+    <select id="mode">
+        <option value="DRIVE">Drive</option>
+        <option value="WALK">Walk</option>
+    </select>
+    <button onclick="getRoutes()">Get routes</button>
+    <button style="background:red;color:white;">Emergency: call police</button>
+
+    <!-- Map container -->
+    <div id="map"></div>
+
+    <script>
+        // Initialize map
+        var map = L.map('map').setView([28.6139, 77.2090], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        // Function to call backend
+        async function getRoutes() {
+            const start = document.getElementById("start").value;
+            const end = document.getElementById("end").value;
+            const mode = document.getElementById("mode").value;
+
+            try {
+                const response = await fetch("/getRoutes", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ start, end, mode })
+                });
+
+                const data = await response.json();
+                console.log("Backend response:", data);
+
+                // Clear old routes
+                map.eachLayer(function(layer) {
+                    if (layer instanceof L.Polyline) {
+                        map.removeLayer(layer);
+                    }
+                });
+
+                // Draw fastest route in blue
+                if (data.fastest_route) {
+                    L.polyline(data.fastest_route.path, { color: "blue" }).addTo(map);
+                }
+
+                // Draw safest route in green
+                if (data.safest_route) {
+                    L.polyline(data.safest_route.path, { color: "green" }).addTo(map);
+                }
+            } catch (err) {
+                console.error("Error fetching routes:", err);
+                alert("Failed to fetch routes. Check backend logs.");
+            }
+        }
+    </script>
+</body>
+</html>
