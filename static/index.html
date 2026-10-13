@@ -11,6 +11,7 @@
         input, select, button { margin: 5px; padding: 8px; }
         #map { height: 400px; margin-top: 20px; }
         button { cursor: pointer; }
+        #route-attribution { margin-top: 8px; font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -28,6 +29,7 @@
 
     <!-- Map container -->
     <div id="map"></div>
+    <div id="route-attribution">Map data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · Routing by <a href="https://project-osrm.org/">OSRM</a></div>
 
     <script>
         // Initialize map
@@ -51,6 +53,9 @@
 
                 const data = await response.json();
                 console.log("Backend response:", data);
+                if (!response.ok) {
+                    throw new Error(data.error || `Route request failed (${response.status})`);
+                }
 
                 // Clear old routes
                 map.eachLayer(function(layer) {
@@ -70,7 +75,7 @@
                 }
             } catch (err) {
                 console.error("Error fetching routes:", err);
-                alert("Failed to fetch routes. Check backend logs.");
+                alert(err.message || "Failed to fetch routes. Please try again.");
             }
         }
     </script>
